@@ -204,6 +204,32 @@ import (
 	"github.com/sagernet/wireguard-go/tun"
 )
 
+// DataPlaneMode selects which stack owns general packet processing.
+type DataPlaneMode uint8
+
+const (
+	// DataPlaneAuto preserves historical tsnet behavior: use the userspace
+	// netstack with the fake TUN, or retain a service-only netstack when a
+	// custom system TUN is supplied.
+	DataPlaneAuto DataPlaneMode = iota
+
+	// DataPlaneUserspace uses the fake TUN and gVisor as the packet owner.
+	DataPlaneUserspace
+
+	// DataPlaneSystemServices uses a custom system TUN for general traffic,
+	// while retaining gVisor only for explicit tsnet listeners and services.
+	DataPlaneSystemServices
+
+	// DataPlaneSystem uses the custom system TUN and host network stack as
+	// the only packet owners. No gVisor netstack is constructed.
+	DataPlaneSystem
+)
+
+// ErrNetstackDisabled is returned by tsnet listener APIs when the server is
+// configured with DataPlaneSystem. Applications should use ordinary host
+// sockets bound to the system TUN addresses in that mode.
+var ErrNetstackDisabled = errors.New("tsnet: userspace netstack is disabled")
+
 // Server is an embedded Tailscale server.
 //
 // Its exported fields may be changed until the first method call.
@@ -316,6 +342,10 @@ type Server struct {
 	// custom Tun device. If nil while Tun is set, a system router is created.
 	Router router.Router
 
+	// DataPlaneMode selects whether gVisor or the host network stack owns
+	// general traffic. DataPlaneAuto preserves compatibility.
+	DataPlaneMode DataPlaneMode
+
 	Dialer N.Dialer
 
 	LookupHook          dnscache.LookupHookFunc
@@ -366,6 +396,29 @@ type Server struct {
 // is non-nil: if nil, the connection is rejected. If non-nil, handler takes
 // over the TCP conn.
 type FallbackTCPHandler func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool)
+
+func (s *Server) resolvedDataPlaneMode() (DataPlaneMode, error) {
+	mode := s.DataPlaneMode
+	if mode == DataPlaneAuto {
+		if s.Tun == nil {
+			return DataPlaneUserspace, nil
+		}
+		return DataPlaneSystemServices, nil
+	}
+	switch mode {
+	case DataPlaneUserspace:
+		if s.Tun != nil {
+			return 0, errors.New("tsnet: DataPlaneUserspace requires the default fake TUN")
+		}
+	case DataPlaneSystemServices, DataPlaneSystem:
+		if s.Tun == nil {
+			return 0, errors.New("tsnet: system data-plane mode requires a custom TUN")
+		}
+	default:
+		return 0, fmt.Errorf("tsnet: unknown data-plane mode %d", mode)
+	}
+	return mode, nil
+}
 
 // Dial connects to the address on the tailnet.
 // It will start the server if it has not been started yet.
@@ -772,6 +825,11 @@ func (s *Server) start() (reterr error) {
 	var closePool closeOnErrorPool
 	defer closePool.closeAllIfError(&reterr)
 
+	dataPlaneMode, err := s.resolvedDataPlaneMode()
+	if err != nil {
+		return err
+	}
+
 	exe, err := os.Executable()
 	if err != nil {
 		switch runtime.GOOS {
@@ -889,54 +947,56 @@ func (s *Server) start() (reterr error) {
 	sys.HealthTracker.Get().SetMetricsRegistry(sys.UserMetricsRegistry())
 
 	// TODO(oxtoacart): do we need to support Taildrive on tsnet, and if so, how?
-	ns, err := netstack.Create(tsLogf, sys.Tun.Get(), eng, sys.MagicSock.Get(), s.dialer, sys.DNSManager.Get(), sys.ProxyMapper())
-	if err != nil {
-		return fmt.Errorf("netstack.Create: %w", err)
+	var ns *netstack.Impl
+	if dataPlaneMode != DataPlaneSystem {
+		ns, err = netstack.Create(tsLogf, sys.Tun.Get(), eng, sys.MagicSock.Get(), s.dialer, sys.DNSManager.Get(), sys.ProxyMapper())
+		if err != nil {
+			return fmt.Errorf("netstack.Create: %w", err)
+		}
+		sys.Set(ns)
+		if dataPlaneMode == DataPlaneUserspace {
+			// The default fake TUN delegates all packet processing to gVisor.
+			ns.ProcessLocalIPs = true
+			ns.ProcessSubnets = true
+		} else {
+			// A custom TUN owns general traffic; retain gVisor only for
+			// explicitly registered tsnet listeners and services.
+			ns.CheckLocalTransportEndpoints = true
+		}
+		ns.GetTCPHandlerForFlow = s.getTCPHandlerForFlow
+		ns.GetUDPHandlerForFlow = s.getUDPHandlerForFlow
+		s.netstack = ns
+		s.dialer.UseNetstackForIP = func(ip netip.Addr) bool {
+			// s.lb is assigned below, before any dials can happen.
+			_, ok := s.lb.PeerForIP(ip)
+			return ok
+		}
+		s.dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+			// Note: don't just return ns.DialContextTCP or we'll return
+			// *gonet.TCPConn(nil) instead of a nil interface which trips up
+			// callers.
+			v4, v6 := s.TailscaleIPs()
+			src := bools.IfElse(dst.Addr().Is6(), v6, v4)
+			tcpConn, err := ns.DialContextTCPWithBind(ctx, src, dst)
+			if err != nil {
+				return nil, err
+			}
+			return tcpConn, nil
+		}
+		s.dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+			// Note: don't just return ns.DialContextUDP or we'll return
+			// *gonet.UDPConn(nil) instead of a nil interface which trips up
+			// callers.
+			v4, v6 := s.TailscaleIPs()
+			src := bools.IfElse(dst.Addr().Is6(), v6, v4)
+			udpConn, err := ns.DialContextUDPWithBind(ctx, src, dst)
+			if err != nil {
+				return nil, err
+			}
+			return udpConn, nil
+		}
 	}
 	sys.Tun.Get().Start()
-	sys.Set(ns)
-	if s.Tun == nil {
-		// Only process packets in netstack when using the default fake TUN.
-		// When a TUN is provided, let packets flow through it instead.
-		ns.ProcessLocalIPs = true
-		ns.ProcessSubnets = true
-	} else {
-		// When using a TUN, check gVisor for registered endpoints to handle
-		// packets for tsnet listeners and outbound connection replies.
-		ns.CheckLocalTransportEndpoints = true
-	}
-	ns.GetTCPHandlerForFlow = s.getTCPHandlerForFlow
-	ns.GetUDPHandlerForFlow = s.getUDPHandlerForFlow
-	s.netstack = ns
-	s.dialer.UseNetstackForIP = func(ip netip.Addr) bool {
-		// s.lb is assigned below, before any dials can happen.
-		_, ok := s.lb.PeerForIP(ip)
-		return ok
-	}
-	s.dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-		// Note: don't just return ns.DialContextTCP or we'll return
-		// *gonet.TCPConn(nil) instead of a nil interface which trips up
-		// callers.
-		v4, v6 := s.TailscaleIPs()
-		src := bools.IfElse(dst.Addr().Is6(), v6, v4)
-		tcpConn, err := ns.DialContextTCPWithBind(ctx, src, dst)
-		if err != nil {
-			return nil, err
-		}
-		return tcpConn, nil
-	}
-	s.dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-		// Note: don't just return ns.DialContextUDP or we'll return
-		// *gonet.UDPConn(nil) instead of a nil interface which trips up
-		// callers.
-		v4, v6 := s.TailscaleIPs()
-		src := bools.IfElse(dst.Addr().Is6(), v6, v4)
-		udpConn, err := ns.DialContextUDPWithBind(ctx, src, dst)
-		if err != nil {
-			return nil, err
-		}
-		return udpConn, nil
-	}
 
 	if s.Store == nil {
 		stateFile := filepath.Join(s.rootPath, "tailscaled.state")
@@ -964,8 +1024,10 @@ func (s *Server) start() (reterr error) {
 	}
 	s.logf("tsnet starting with hostname %q, varRoot %q", s.hostname, s.rootPath)
 	s.lb = lb
-	if err := ns.Start(lb); err != nil {
-		return fmt.Errorf("failed to start netstack: %w", err)
+	if ns != nil {
+		if err := ns.Start(lb); err != nil {
+			return fmt.Errorf("failed to start netstack: %w", err)
+		}
 	}
 	closePool.addFunc(func() { s.lb.Shutdown() })
 	prefs := ipn.NewPrefs()
@@ -1358,6 +1420,9 @@ func (s *Server) ListenPacket(network, addr string) (net.PacketConn, error) {
 	}
 	if err := s.Start(); err != nil {
 		return nil, err
+	}
+	if s.netstack == nil {
+		return nil, ErrNetstackDisabled
 	}
 
 	// Create the gVisor PacketConn first so it can handle port 0 allocation.
@@ -2069,6 +2134,9 @@ func (s *Server) listen(network, addr string, lnOn listenOn) (net.Listener, erro
 	}
 	if err := s.Start(); err != nil {
 		return nil, err
+	}
+	if s.netstack == nil {
+		return nil, ErrNetstackDisabled
 	}
 
 	isTCP := network == "" || network == "tcp" || network == "tcp4" || network == "tcp6"
