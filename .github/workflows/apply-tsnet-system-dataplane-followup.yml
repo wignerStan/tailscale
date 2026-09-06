@@ -1,0 +1,172 @@
+name: apply tsnet system dataplane follow-up
+
+on:
+  push:
+    branches:
+      - automation/tsnet-system-dataplane-followup
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Apply and validate follow-up
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}: {old[:80]!r}")
+              path.write_text(text.replace(old, new, 1))
+
+          tsnet = Path("tsnet/tsnet.go")
+          replace_once(
+              tsnet,
+              '''// ErrNetstackDisabled is returned by tsnet listener APIs when the server is
+          // configured with DataPlaneSystem. Applications should use ordinary host
+          // sockets bound to the system TUN addresses in that mode.
+          var ErrNetstackDisabled = errors.New("tsnet: userspace netstack is disabled")
+          ''',
+              '''// ErrNetstackDisabled is returned by tsnet listener APIs when the server is
+          // configured with DataPlaneSystem. Applications should use ordinary host
+          // sockets bound to the system TUN addresses in that mode.
+          var ErrNetstackDisabled = errors.New("tsnet: userspace netstack is disabled")
+
+          // ErrDataPlaneDialerUnavailable is returned by Dial in DataPlaneSystem mode
+          // when the embedding application has not supplied DataPlaneDial. Falling
+          // back to the ordinary host route would violate the system TUN's packet
+          // ownership boundary and can bypass a selected exit node.
+          var ErrDataPlaneDialerUnavailable = errors.New("tsnet: system data-plane dialer is unavailable")
+          ''',
+          )
+          replace_once(
+              tsnet,
+              '''\t// DataPlaneMode selects whether gVisor or the host network stack owns
+          \t// general traffic. DataPlaneAuto preserves compatibility.
+          \tDataPlaneMode DataPlaneMode
+
+          \tDialer N.Dialer
+          ''',
+              '''\t// DataPlaneMode selects whether gVisor or the host network stack owns
+          \t// general traffic. DataPlaneAuto preserves compatibility.
+          \tDataPlaneMode DataPlaneMode
+
+          \t// DataPlaneDial opens a payload connection through the custom system TUN.
+          \t// It is used only by Dial in DataPlaneSystem mode. The embedding
+          \t// application must constrain the returned host socket to the custom TUN;
+          \t// control-plane traffic continues to use Dialer instead.
+          \t//
+          \t// When nil, Dial returns ErrDataPlaneDialerUnavailable instead of
+          \t// silently falling back to the host's ordinary routing table.
+          \tDataPlaneDial func(context.Context, string, string) (net.Conn, error)
+
+          \tDialer N.Dialer
+          ''',
+          )
+          replace_once(
+              tsnet,
+              '''func (s *Server) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+          \tif err := s.Start(); err != nil {
+          \t\treturn nil, err
+          \t}
+          \tif err := s.awaitRunning(ctx); err != nil {
+          \t\treturn nil, err
+          \t}
+          \treturn s.dialer.UserDial(ctx, network, address)
+          }
+          ''',
+              '''func (s *Server) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+          \tif err := s.Start(); err != nil {
+          \t\treturn nil, err
+          \t}
+          \tif err := s.awaitRunning(ctx); err != nil {
+          \t\treturn nil, err
+          \t}
+          \tdataPlaneMode, err := s.resolvedDataPlaneMode()
+          \tif err != nil {
+          \t\treturn nil, err
+          \t}
+          \treturn s.dialDataPlane(ctx, dataPlaneMode, network, address)
+          }
+
+          func (s *Server) dialDataPlane(ctx context.Context, dataPlaneMode DataPlaneMode, network, address string) (net.Conn, error) {
+          \tif dataPlaneMode == DataPlaneSystem {
+          \t\tif s.DataPlaneDial == nil {
+          \t\t\treturn nil, ErrDataPlaneDialerUnavailable
+          \t\t}
+          \t\treturn s.DataPlaneDial(ctx, network, address)
+          \t}
+          \treturn s.dialer.UserDial(ctx, network, address)
+          }
+          ''',
+          )
+
+          tests = Path("tsnet/dataplane_mode_test.go")
+          replace_once(
+              tests,
+              '''import (
+          \t"testing"
+
+          \t"github.com/sagernet/tailscale/net/tstun"
+          )
+          ''',
+              '''import (
+          \t"context"
+          \t"errors"
+          \t"net"
+          \t"testing"
+
+          \t"github.com/sagernet/tailscale/net/tstun"
+          )
+          ''',
+          )
+          with tests.open("a") as f:
+              f.write('''
+          func TestPureSystemDialRequiresExplicitDataPlaneDialer(t *testing.T) {
+          \tserver := &Server{}
+          \t_, err := server.dialDataPlane(context.Background(), DataPlaneSystem, "tcp", "100.64.0.1:443")
+          \tif !errors.Is(err, ErrDataPlaneDialerUnavailable) {
+          \t\tt.Fatalf("dial error = %v, want %v", err, ErrDataPlaneDialerUnavailable)
+          \t}
+
+          \tsentinel := errors.New("data-plane dial called")
+          \tvar gotNetwork, gotAddress string
+          \tserver.DataPlaneDial = func(_ context.Context, network, address string) (net.Conn, error) {
+          \t\tgotNetwork = network
+          \t\tgotAddress = address
+          \t\treturn nil, sentinel
+          \t}
+          \t_, err = server.dialDataPlane(context.Background(), DataPlaneSystem, "tcp6", "[fd7a:115c:a1e0::1]:8443")
+          \tif !errors.Is(err, sentinel) {
+          \t\tt.Fatalf("dial error = %v, want callback error %v", err, sentinel)
+          \t}
+          \tif gotNetwork != "tcp6" || gotAddress != "[fd7a:115c:a1e0::1]:8443" {
+          \t\tt.Fatalf("callback arguments = (%q, %q)", gotNetwork, gotAddress)
+          \t}
+          }
+          ''')
+          PY
+
+          gofmt -w tsnet/tsnet.go tsnet/dataplane_mode_test.go
+          git diff --check
+          go test ./tsnet ./tsd ./ipn/ipnlocal
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tsnet/tsnet.go tsnet/dataplane_mode_test.go
+          git rm .github/workflows/apply-tsnet-system-dataplane-followup.yml
+          git commit -s -m "fix(tsnet): require explicit pure-system payload dialer"
+          git push origin HEAD:${{ github.ref_name }}
