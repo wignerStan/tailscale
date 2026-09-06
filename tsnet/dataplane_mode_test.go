@@ -1,6 +1,9 @@
 package tsnet
 
 import (
+	"context"
+	"errors"
+	"net"
 	"testing"
 
 	"github.com/sagernet/tailscale/net/tstun"
@@ -33,5 +36,28 @@ func TestResolvedDataPlaneMode(t *testing.T) {
 				t.Fatalf("resolvedDataPlaneMode() = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestPureSystemDialRequiresExplicitDataPlaneDialer(t *testing.T) {
+	server := &Server{}
+	_, err := server.dialDataPlane(context.Background(), DataPlaneSystem, "tcp", "100.64.0.1:443")
+	if !errors.Is(err, ErrDataPlaneDialerUnavailable) {
+		t.Fatalf("dial error = %v, want %v", err, ErrDataPlaneDialerUnavailable)
+	}
+
+	sentinel := errors.New("data-plane dial called")
+	var gotNetwork, gotAddress string
+	server.DataPlaneDial = func(_ context.Context, network, address string) (net.Conn, error) {
+		gotNetwork = network
+		gotAddress = address
+		return nil, sentinel
+	}
+	_, err = server.dialDataPlane(context.Background(), DataPlaneSystem, "tcp6", "[fd7a:115c:a1e0::1]:8443")
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("dial error = %v, want callback error %v", err, sentinel)
+	}
+	if gotNetwork != "tcp6" || gotAddress != "[fd7a:115c:a1e0::1]:8443" {
+		t.Fatalf("callback arguments = (%q, %q)", gotNetwork, gotAddress)
 	}
 }
