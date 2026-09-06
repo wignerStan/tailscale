@@ -230,6 +230,12 @@ const (
 // sockets bound to the system TUN addresses in that mode.
 var ErrNetstackDisabled = errors.New("tsnet: userspace netstack is disabled")
 
+// ErrDataPlaneDialerUnavailable is returned by Dial in DataPlaneSystem mode
+// when the embedding application has not supplied DataPlaneDial. Falling
+// back to the ordinary host route would violate the system TUN's packet
+// ownership boundary and can bypass a selected exit node.
+var ErrDataPlaneDialerUnavailable = errors.New("tsnet: system data-plane dialer is unavailable")
+
 // Server is an embedded Tailscale server.
 //
 // Its exported fields may be changed until the first method call.
@@ -346,6 +352,15 @@ type Server struct {
 	// general traffic. DataPlaneAuto preserves compatibility.
 	DataPlaneMode DataPlaneMode
 
+	// DataPlaneDial opens a payload connection through the custom system TUN.
+	// It is used only by Dial in DataPlaneSystem mode. The embedding
+	// application must constrain the returned host socket to the custom TUN;
+	// control-plane traffic continues to use Dialer instead.
+	//
+	// When nil, Dial returns ErrDataPlaneDialerUnavailable instead of
+	// silently falling back to the host's ordinary routing table.
+	DataPlaneDial func(context.Context, string, string) (net.Conn, error)
+
 	Dialer N.Dialer
 
 	LookupHook          dnscache.LookupHookFunc
@@ -428,6 +443,20 @@ func (s *Server) Dial(ctx context.Context, network, address string) (net.Conn, e
 	}
 	if err := s.awaitRunning(ctx); err != nil {
 		return nil, err
+	}
+	dataPlaneMode, err := s.resolvedDataPlaneMode()
+	if err != nil {
+		return nil, err
+	}
+	return s.dialDataPlane(ctx, dataPlaneMode, network, address)
+}
+
+func (s *Server) dialDataPlane(ctx context.Context, dataPlaneMode DataPlaneMode, network, address string) (net.Conn, error) {
+	if dataPlaneMode == DataPlaneSystem {
+		if s.DataPlaneDial == nil {
+			return nil, ErrDataPlaneDialerUnavailable
+		}
+		return s.DataPlaneDial(ctx, network, address)
 	}
 	return s.dialer.UserDial(ctx, network, address)
 }
