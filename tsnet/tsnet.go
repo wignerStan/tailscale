@@ -1966,6 +1966,13 @@ func (s *Server) ListenService(name string, mode ServiceMode) (*ServiceListener,
 	if mode == nil {
 		return nil, errors.New("mode may not be nil")
 	}
+	dataPlaneMode, err := s.resolvedDataPlaneMode()
+	if err != nil {
+		return nil, err
+	}
+	if dataPlaneMode == DataPlaneSystem {
+		return nil, ErrNetstackDisabled
+	}
 
 	// We collect cleanup tasks as we go and execute these on error. If we make
 	// it to the end we abandon these cleanup tasks by setting onError to nil.
@@ -1979,7 +1986,7 @@ func (s *Server) ListenService(name string, mode ServiceMode) (*ServiceListener,
 	// TODO(hwh33,tailscale/corp#35859): support TUN mode
 
 	ctx := context.Background()
-	_, err := s.Up(ctx)
+	_, err = s.Up(ctx)
 	if err != nil {
 		return nil, err
 	}

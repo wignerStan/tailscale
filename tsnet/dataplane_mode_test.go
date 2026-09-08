@@ -61,3 +61,14 @@ func TestPureSystemDialRequiresExplicitDataPlaneDialer(t *testing.T) {
 		t.Fatalf("callback arguments = (%q, %q)", gotNetwork, gotAddress)
 	}
 }
+
+func TestPureSystemListenServiceRequiresNetstack(t *testing.T) {
+	server := &Server{
+		Tun:           tstun.NewFake(),
+		DataPlaneMode: DataPlaneSystem,
+	}
+	_, err := server.ListenService("svc:test", ServiceModeTCP{Port: 443})
+	if !errors.Is(err, ErrNetstackDisabled) {
+		t.Fatalf("ListenService error = %v, want %v", err, ErrNetstackDisabled)
+	}
+}
