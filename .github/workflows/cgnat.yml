@@ -1,0 +1,47 @@
+name: CGNAT 1.94.2 backport
+on:
+  push:
+    branches: [fix/cgnat-direct-udp-1.94.2]
+    paths: ['net/netmon/**', 'util/linuxfw/**', 'scripts/test-cgnat-kernel.sh', '.github/workflows/cgnat.yml', 'go.mod', 'go.sum']
+permissions:
+  contents: read
+concurrency:
+  group: cgnat-backport-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      - name: Test discovery and both firewall implementations
+        run: |
+          go test -race -count=1 ./net/netmon ./util/linuxfw
+          go vet ./net/netmon ./util/linuxfw
+          sudo apt-get update -qq
+          sudo apt-get install -y iproute2 iptables nftables
+          go test -c -tags cgnat_integration -o "$RUNNER_TEMP/cgnat-firewall.test" ./util/linuxfw
+          bash scripts/test-cgnat-kernel.sh "$RUNNER_TEMP/cgnat-firewall.test"
+      - name: Build pinned standalone Linux peer
+        run: |
+          set -euxo pipefail
+          mkdir artifacts
+          stamp="1.94.2-cgnat-$(git rev-parse --short=12 HEAD)"
+          CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags "-s -w -X tailscale.com/version.longStamp=$stamp -X tailscale.com/version.shortStamp=1.94.2" -o artifacts/tailscaled ./cmd/tailscaled
+          CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags "-s -w -X tailscale.com/version.longStamp=$stamp -X tailscale.com/version.shortStamp=1.94.2" -o artifacts/tailscale ./cmd/tailscale
+          artifacts/tailscaled --version
+          artifacts/tailscale version
+          git rev-parse HEAD > artifacts/SOURCE_COMMIT
+          git diff --exit-code -- go.mod go.sum
+          git archive HEAD | gzip > artifacts/source.tar.gz
+          (cd artifacts && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-1.94.2-cgnat-linux-amd64
+          path: artifacts/
+          retention-days: 30
