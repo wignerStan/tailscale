@@ -56,6 +56,12 @@ func (m *Monitor) SetTailscaleInterfaceName(ifName string) {
 //
 // This should be called as early as possible during tailscaled startup.
 func SetTailscaleInterfaceProps(ifName string, ifIndex int) {
+	// An embedding application releases these process-global properties when
+	// its endpoint closes. Clearing must not depend on OS enumeration working.
+	if ifName == "" {
+		tsIfProps.set("", 0)
+		return
+	}
 	if ifIndex != 0 {
 		tsIfProps.set(ifName, ifIndex)
 		return
