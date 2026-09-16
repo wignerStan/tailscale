@@ -2,7 +2,7 @@ name: Publish CGNAT fixes
 on:
   push:
     branches: [fix/cgnat-direct-udp]
-    paths: [.github/workflows/cgnat-implement.yml, automation/cgnat_fix.py, automation/cgnat-ci.yml, automation/test-cgnat-kernel.sh]
+    paths: [.github/workflows/cgnat-implement.yml, automation/cgnat_fix.py, automation/test-cgnat-kernel.sh]
 permissions:
   contents: read
 jobs:
@@ -18,12 +18,11 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
         with:
-          ref: 76dc752abe20efe2bc43e5521f999d8f7356c95f
+          ref: fix/cgnat-direct-udp-native
           path: core
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
         with:
-          repository: tailscale/tailscale
-          ref: v1.94.2
+          ref: fix/cgnat-direct-udp-1.94.2
           path: backport
       - uses: actions/setup-go@v5
         with:
@@ -35,36 +34,32 @@ jobs:
           python3 control/automation/cgnat_fix.py core
           python3 control/automation/cgnat_fix.py backport backport
           for repo in core backport; do
-            mkdir -p "$repo/.github/workflows" "$repo/scripts"
-            cp control/automation/cgnat-ci.yml "$repo/.github/workflows/cgnat.yml"
+            mkdir -p "$repo/scripts"
             cp control/automation/test-cgnat-kernel.sh "$repo/scripts/test-cgnat-kernel.sh"
             gofmt -w "$repo/net/netmon/state.go" "$repo/net/netmon/interfaces.go" "$repo/net/netmon/local_addresses_cgnat_test.go" "$repo/util/linuxfw/iptables_runner.go" "$repo/util/linuxfw/nftables_runner.go" "$repo/util/linuxfw/"*cgnat*go
             git -C "$repo" diff --check
-            git -C "$repo" diff --stat
           done
-      - name: Validate before publishing
+      - name: Validate units and real UDP firewall behavior
         run: |
           set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y iproute2 iptables nftables
           for repo in core backport; do
             (cd "$repo" && go test -race -count=1 ./net/netmon ./util/linuxfw && go vet ./net/netmon ./util/linuxfw)
+            (cd "$repo" && go test -c -tags cgnat_integration -o "$RUNNER_TEMP/$repo-firewall.test" ./util/linuxfw)
+            bash "$repo/scripts/test-cgnat-kernel.sh" "$RUNNER_TEMP/$repo-firewall.test"
           done
-      - name: Commit and push only fork branches
+      - name: Commit and push source-only fork branches
         run: |
           set -euxo pipefail
           for repo in core backport; do
             git -C "$repo" config user.name 'github-actions[bot]'
             git -C "$repo" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git -C "$repo" add net/netmon util/linuxfw CGNAT_DIRECT_UDP.md scripts/test-cgnat-kernel.sh
           done
-          git -C backport remote set-url origin https://github.com/wignerStan/tailscale.git
-          git -C backport push origin HEAD:refs/heads/baseline/tailscale-v1.94.2
-          git -C core add net/netmon util/linuxfw CGNAT_DIRECT_UDP.md .github/workflows/cgnat.yml scripts/test-cgnat-kernel.sh
           git -C core commit -s -m 'fix(netmon,linuxfw): allow direct UDP on CGNAT underlays'
           git -C core push origin HEAD:refs/heads/fix/cgnat-direct-udp-native
-          git -C backport add net/netmon util/linuxfw CGNAT_DIRECT_UDP.md .github/workflows/cgnat.yml scripts/test-cgnat-kernel.sh
           git -C backport commit -s -m 'fix(netmon,linuxfw): backport CGNAT direct UDP support to 1.94.2'
           git -C backport push origin HEAD:refs/heads/fix/cgnat-direct-udp-1.94.2
-          {
-            echo '## Published source commits'
-            echo "Native: $(git -C core rev-parse HEAD)"
-            echo "Standalone 1.94.2: $(git -C backport rev-parse HEAD)"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Native: $(git -C core rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Standalone: $(git -C backport rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
