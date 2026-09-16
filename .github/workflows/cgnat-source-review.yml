@@ -1,0 +1,42 @@
+name: CGNAT source review
+on:
+  push:
+    branches: [fix/cgnat-direct-udp]
+    paths: [.github/workflows/cgnat-source-review.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          path: tailscale
+          persist-credentials: false
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          repository: wignerStan/sing-box
+          ref: 72e1829e5e431d344d2af8fd50895bca9f1f172a
+          path: sing-box
+          persist-credentials: false
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          repository: tailscale/tailscale
+          ref: v1.94.2
+          path: tailscaled
+          persist-credentials: false
+      - name: Export tracked source and repository instructions
+        run: |
+          mkdir sources
+          for repo in tailscale sing-box tailscaled; do
+            git -C "$repo" rev-parse HEAD
+            git -C "$repo" ls-files '*AGENTS.md' | while read -r file; do
+              echo "--- $repo/$file"; cat "$repo/$file"
+            done
+            git -C "$repo" archive --format=tar HEAD | gzip > "sources/$repo.tar.gz"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cgnat-pinned-sources
+          path: sources/
+          retention-days: 7
