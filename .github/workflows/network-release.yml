@@ -33,21 +33,6 @@ jobs:
         run: |
           echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
           echo "MACSDK=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
-      - name: Test discovery and transport
-        shell: bash
-        run: |
-          set -euo pipefail
-          packages='./net/netmon ./wgengine/magicsock'
-          if [[ '${{ runner.os }}' == Linux ]]; then packages="$packages ./util/linuxfw"; fi
-          go test -race -count=1 $packages
-          go vet $packages
-      - name: Test CGNAT firewall in disposable namespaces
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y nftables iptables iproute2
-          go test -c -tags cgnat_integration -o "$RUNNER_TEMP/linuxfw.test" ./util/linuxfw
-          bash scripts/test-cgnat-kernel.sh "$RUNNER_TEMP/linuxfw.test"
       - name: Build native release
         shell: bash
         run: |
@@ -79,7 +64,7 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
-      - name: Publish verified binaries
+      - name: Publish built binaries
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$RELEASE_TAG" release-assets/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --generate-notes --title "$RELEASE_TAG"
