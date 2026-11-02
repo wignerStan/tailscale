@@ -1,0 +1,71 @@
+name: CGNAT upstream regression evidence
+on:
+  push:
+    branches: [ci/cgnat-upstream-20261102]
+permissions:
+  contents: read
+jobs:
+  regression:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [upstream-firewall, fixed]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Prepare exact upstream firewall baseline
+        if: matrix.variant == 'upstream-firewall'
+        run: |
+          for file in util/linuxfw/iptables_runner.go util/linuxfw/nftables_runner.go; do
+            git show 49aa9c859c4d193b5ecd5f4ccda7b65979837fd8:"$file" > "$file"
+          done
+      - name: Verify fixed discovery and firewall packages
+        if: matrix.variant == 'fixed'
+        run: |
+          go test -race -count=1 ./net/netmon ./util/linuxfw
+          go vet ./net/netmon ./util/linuxfw
+      - name: Prove upstream rule-order failure
+        if: matrix.variant == 'upstream-firewall'
+        run: |
+          set +e
+          go test -count=1 -run '^TestMagicsockCGNAT' ./util/linuxfw > "$RUNNER_TEMP/unit-baseline.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/unit-baseline.log"
+          test "$result" -ne 0
+          grep -F 'transport exception is behind CGNAT drop' "$RUNNER_TEMP/unit-baseline.log"
+          grep -F 'transport exception was appended, not prepended' "$RUNNER_TEMP/unit-baseline.log"
+      - name: Build isolated kernel regression fixture
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y iproute2 iptables nftables
+          go test -c -tags cgnat_integration -o "$RUNNER_TEMP/cgnat-kernel.test" ./util/linuxfw
+      - name: Verify fixed kernel behavior
+        if: matrix.variant == 'fixed'
+        run: bash scripts/test-cgnat-kernel.sh "$RUNNER_TEMP/cgnat-kernel.test" | tee "$RUNNER_TEMP/kernel-fixed.log"
+      - name: Prove upstream kernel failure for both backends
+        if: matrix.variant == 'upstream-firewall'
+        run: |
+          for backend in iptables nftables; do
+            set +e
+            bash scripts/test-cgnat-kernel.sh "$RUNNER_TEMP/cgnat-kernel.test" "$backend" > "$RUNNER_TEMP/kernel-$backend-baseline.log" 2>&1
+            result=$?
+            set -e
+            cat "$RUNNER_TEMP/kernel-$backend-baseline.log"
+            test "$result" -ne 0
+            grep -F 'accepted=true, read=' "$RUNNER_TEMP/kernel-$backend-baseline.log"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cgnat-${{ matrix.variant }}-evidence
+          path: ${{ runner.temp }}/*.log
+          if-no-files-found: ignore
