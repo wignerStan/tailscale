@@ -27,5 +27,7 @@ jobs:
           echo "MACSDK=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
       - name: Verify system dataplane and physical transport
         run: |
-          go test -race -count=1 ./tsnet ./net/netmon ./wgengine/magicsock ./util/linuxfw
-          go vet ./tsnet ./net/netmon ./wgengine/magicsock ./util/linuxfw
+          packages="./tsnet ./net/netmon ./wgengine/magicsock"
+          if [ "${{ runner.os }}" = Linux ]; then packages="$packages ./util/linuxfw"; fi
+          go test -race -count=1 $packages
+          go vet $packages
