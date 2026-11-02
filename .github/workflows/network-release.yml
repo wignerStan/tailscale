@@ -1,0 +1,85 @@
+name: Native network release
+on:
+  push:
+    branches: [release/v1.104.4-wigner.1]
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  RELEASE_TAG: v1.104.4-wigner.1
+  GOTOOLCHAIN: local
+jobs:
+  product:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-amd64
+          - runner: macos-15
+            target: darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Set Darwin SDK
+        if: runner.os == 'macOS'
+        run: |
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+          echo "MACSDK=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      - name: Test discovery and transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages='./net/netmon ./wgengine/magicsock'
+          if [[ '${{ runner.os }}' == Linux ]]; then packages="$packages ./util/linuxfw"; fi
+          go test -race -count=1 $packages
+          go vet $packages
+      - name: Test CGNAT firewall in disposable namespaces
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y nftables iptables iproute2
+          go test -c -tags cgnat_integration -o "$RUNNER_TEMP/linuxfw.test" ./util/linuxfw
+          bash scripts/test-cgnat-kernel.sh "$RUNNER_TEMP/linuxfw.test"
+      - name: Build native release
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='${{ matrix.target }}'
+          version=${RELEASE_TAG#v}
+          mkdir -p "$RUNNER_TEMP/product"
+          for command in tailscale tailscaled; do
+            CGO_ENABLED=0 GOOS="${target%-*}" GOARCH="${target#*-}" go build -trimpath -buildvcs=false -ldflags "-s -w -X tailscale.com/version.longStamp=$version-${GITHUB_SHA:0:8} -X tailscale.com/version.shortStamp=$version" -o "$RUNNER_TEMP/product/$command" "./cmd/$command"
+          done
+          "$RUNNER_TEMP/product/tailscale" version
+          git rev-parse HEAD > "$RUNNER_TEMP/product/SOURCE_COMMIT"
+          echo 27047635f237d1f3e0b08c0f487674757f30d2f7 > "$RUNNER_TEMP/product/UPSTREAM_COMMIT"
+          cd "$RUNNER_TEMP/product"
+          shasum -a 256 tailscale tailscaled SOURCE_COMMIT UPSTREAM_COMMIT > SHA256SUMS
+          tar -czf "$RUNNER_TEMP/tailscale-$RELEASE_TAG-$target.tar.gz" tailscale tailscaled SOURCE_COMMIT UPSTREAM_COMMIT SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-${{ matrix.target }}
+          path: ${{ runner.temp }}/tailscale-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+  release:
+    needs: product
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Publish verified binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$RELEASE_TAG" release-assets/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --generate-notes --title "$RELEASE_TAG"
