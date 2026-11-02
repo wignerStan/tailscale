@@ -71,6 +71,8 @@ func TestCGNATTransportKernel(t *testing.T) {
 	})
 	must(runner.AddHooks())
 	must(runner.AddBase("tailscale0"))
+	// Current upstream installs CGNAT policy separately from the base chains.
+	must(runner.AddExternalCGNATRules(CGNATModeDrop, "tailscale0"))
 	listen := func(port int) *net.UDPConn {
 		c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("100.64.50.2"), Port: port})
 		must(err)
